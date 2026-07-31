@@ -1,6 +1,21 @@
+v1:
+
 gst-launch-1.0 -v sdrsrc mode=tcp host=192.168.1.1 port=1234 frequency=92000000 sample-rate=250000 gain=4.0 ! queue max-size-buffers=0 max-size-bytes=0 max-size-time=200000000 leaky=downstream ! sdrdemod mode=fm stereo=true max-deviation=75000 audio-rate=48000 audio-cutoff=15000 tau=50 freq-offset=0 ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=1 ! sdrdenoise enabled=true threshold-db=8 alpha-up=0.01 alpha-down=0.0001 ! queue max-size-buffers=0 max-size-bytes=0 max-size-time=1000000000 ! autoaudiosink sync=false
 
+v2;
 
+gst-launch-1.0 -v \
+  sdrsrc mode=tcp host=192.168.1.1 port=1234 frequency=92000000 sample-rate=250000 \
+    gain=4.0 auto-gain=true auto-gain-target-db=-18.0 \
+  ! queue max-size-buffers=0 max-size-bytes=0 max-size-time=200000000 leaky=downstream \
+  ! sdrdemod mode=fm stereo=true max-deviation=75000 audio-rate=48000 audio-cutoff=15000 \
+    tau=50 freq-offset=0 \
+    if-bandwidth=0 auto-bandwidth=true \
+  ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=1 \
+  ! sdrdenoise enabled=true threshold-db=8 alpha-up=0.01 alpha-down=0.0001 \
+    interpolate=true auto-interpolate=true interp-strength=0.5 \
+  ! queue max-size-buffers=0 max-size-bytes=0 max-size-time=1000000000 \
+  ! autoaudiosink sync=false
 
 meson setup builddir --prefix=/usr
 
