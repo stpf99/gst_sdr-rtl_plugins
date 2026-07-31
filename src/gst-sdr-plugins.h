@@ -43,6 +43,14 @@ struct _GstSdrSrc {
   gsize recv_buf_size;
   guint8 pending_byte;
   gboolean has_pending_byte;
+  gboolean flushing;
+  /* --auto-gain: software AGC loop running inside create(), independent
+   * of the legacy gain<=0 "hardware AGC" meaning (which is preserved). */
+  gboolean auto_gain;
+  gfloat auto_gain_target_db;
+  gfloat power_ema_db;
+  gboolean power_ema_init;
+  gint auto_gain_hold;
 #if HAVE_RTLSDR
   void *rtl_dev;
 #endif
@@ -117,6 +125,22 @@ struct _GstSdrDemod {
   gfloat pilot_phase;
   gfloat pilot_freq;
   gfloat pilot_integrator;
+
+  /* --auto-bandwidth-if: IF filter bandwidth can now be narrowed manually
+   * (if-bandwidth) or hunted automatically for best S/N (auto-bandwidth).
+   * cfg_lock guards configure()/fir_taps against concurrent property
+   * writes from the app thread while transform() runs on the streaming
+   * thread. */
+  GMutex cfg_lock;
+  gfloat if_bandwidth_hz;       /* 0 = legacy automatic cutoff (unchanged behaviour) */
+  gfloat bw_current_hz;         /* effective cutoff actually applied by configure() */
+  gboolean auto_bandwidth;
+  gfloat snr_lowband_pow;       /* EMA of composite energy inside the audio band */
+  gfloat snr_highband_pow;      /* EMA of composite energy above the audio band (noise proxy) */
+  gfloat snr_lpf_state;         /* one-pole LPF state used to split low/high band energy */
+  gfloat snr_db_ema;
+  gint auto_bw_hold;
+  gint auto_bw_dir;             /* -1 narrowing, +1 widening, 0 idle -- for hysteresis */
 };
 
 struct _GstSdrDemodClass {
@@ -161,6 +185,18 @@ struct _GstSdrDenoise {
   gfloat *out_queue[2];
   gint out_queue_n[2];
   gsize out_queue_cap[2];
+
+  /* --auto-interpolate: light adaptive smoothing pass applied after
+   * denoising, independent of `enabled` -- useful once IF bandwidth has
+   * been narrowed and the audio sounds "choppy". Time-domain, cheap,
+   * always available (does not depend on the spectral noise floor). */
+  gboolean interpolate;
+  gboolean auto_interpolate;
+  gfloat interp_strength;       /* 0..1, manual amount when auto_interpolate is off */
+  gfloat interp_state[2];       /* one-pole smoother state per channel */
+  gfloat hf_energy_ema[2];      /* proxy for high-frequency/noise content */
+  gfloat lf_energy_ema[2];      /* proxy for low-frequency/signal content */
+  gfloat prev_sample[2];        /* for the first-difference HF estimator */
 };
 
 struct _GstSdrDenoiseClass {

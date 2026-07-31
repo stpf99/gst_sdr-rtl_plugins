@@ -16,7 +16,8 @@ GST_DEBUG_CATEGORY_STATIC (gst_sdr_demod_debug);
 
 enum {
   PROP_0, PROP_MODE, PROP_STEREO, PROP_MAX_DEVIATION, PROP_AUDIO_RATE,
-  PROP_AUDIO_CUTOFF, PROP_TAU, PROP_FREQ_OFFSET, PROP_STEREO_MIX, PROP_LAST
+  PROP_AUDIO_CUTOFF, PROP_TAU, PROP_FREQ_OFFSET, PROP_STEREO_MIX,
+  PROP_IF_BANDWIDTH, PROP_AUTO_BANDWIDTH, PROP_LAST
 };
 
 #define DEFAULT_MODE GST_SDR_MODE_FM
@@ -30,6 +31,18 @@ enum {
 #define FIR_TAPS_IF 63
 #define FIR_TAPS_AUDIO 63
 #define PILOT_FREQ_HZ 19000.0f
+
+/* --if-bandwidth / --auto-bandwidth: IF filter cutoff can now be set
+ * explicitly (if-bandwidth, 0 = keep the original automatic formula
+ * below) or hunted live for best S/N (auto-bandwidth). Both are opt-in;
+ * with both left at their defaults, configure() computes exactly the
+ * same cutoff as before this change. */
+#define DEFAULT_IF_BANDWIDTH 0.0f      /* 0 = legacy automatic cutoff */
+#define DEFAULT_AUTO_BANDWIDTH FALSE
+#define AUTO_BW_TARGET_LOW_DB 10.0f    /* narrow further when S/N proxy drops below this */
+#define AUTO_BW_TARGET_HIGH_DB 18.0f   /* widen back out once S/N proxy clears this */
+#define AUTO_BW_STEP_FRAC 0.06f        /* +/-6% of range per adjustment step */
+#define AUTO_BW_HOLD_BUFFERS 40        /* how many transform() calls between adjustments */
 
 static GstStaticPadTemplate sinktemplate = GST_STATIC_PAD_TEMPLATE ("sink",
     GST_PAD_SINK, GST_PAD_ALWAYS,
@@ -166,6 +179,74 @@ calc_if_decim (guint in_rate, gboolean stereo, gfloat max_deviation_hz)
   return dd;
 }
 
+/* Legacy cutoff = exactly what this element always computed before
+ * if-bandwidth/auto-bandwidth existed. min_cutoff = the narrowest we'll
+ * ever let the filter go, whether by manual if-bandwidth or by the
+ * auto-bandwidth hunt -- narrow enough to meaningfully reject adjacent
+ * noise, wide enough that the FM discriminator/pilot PLL still has the
+ * signal they need (stereo needs the 38 kHz subcarrier + guard, mono
+ * just needs the audio band + guard). */
+static void
+calc_bw_bounds (GstSdrDemod * d, gdouble * out_min, gdouble * out_legacy)
+{
+  gdouble legacy, minc;
+  if (d->mode == GST_SDR_MODE_FM) {
+    legacy = MIN ((gdouble) (d->max_deviation + (d->stereo ? 40000.0f : 12000.0f)),
+        0.45 * (gdouble) d->sample_rate);
+    minc = d->stereo
+        ? MIN ((gdouble) (d->max_deviation * 1.15f + 38000.0f), legacy)
+        : MIN ((gdouble) (d->max_deviation * 1.15f + 3000.0f), legacy);
+  } else {
+    legacy = MIN ((gdouble) d->audio_cutoff, 0.45 * (gdouble) d->sample_rate);
+    minc = MIN ((gdouble) d->audio_cutoff * 1.1, legacy);
+  }
+  if (minc < 1000.0)
+    minc = MIN (1000.0, legacy);
+  *out_min = minc;
+  *out_legacy = legacy;
+}
+
+/* Resolves if-bandwidth/auto-bandwidth against the current bounds into
+ * one concrete cutoff, and remembers it in bw_current_hz (also serves
+ * as the auto-bandwidth hunt's running value and as the readback for
+ * the if-bandwidth property). Shared by configure() (full reconfigure,
+ * e.g. on caps change) and reconfigure_if_filter() (bandwidth-only live
+ * retune, used by the property setters and the auto-bandwidth hunt). */
+static gdouble
+calc_effective_cutoff (GstSdrDemod * d)
+{
+  gdouble bw_min, bw_legacy, cutoff;
+  calc_bw_bounds (d, &bw_min, &bw_legacy);
+  if (d->auto_bandwidth) {
+    if (d->bw_current_hz <= 0.0f)
+      d->bw_current_hz = (gfloat) bw_legacy;
+    cutoff = CLAMP ((gdouble) d->bw_current_hz, bw_min, bw_legacy);
+  } else if (d->if_bandwidth_hz > 0.0f) {
+    cutoff = CLAMP ((gdouble) d->if_bandwidth_hz, bw_min, bw_legacy);
+  } else {
+    cutoff = bw_legacy;
+  }
+  d->bw_current_hz = (gfloat) cutoff;
+  return cutoff;
+}
+
+/* Bandwidth-only live retune: rebuilds just the IF lowpass taps and
+ * resets its tail (a small, bounded transient), without touching NCO
+ * phase, pilot PLL, de-emphasis state or decimation factors the way a
+ * full configure() would. Used whenever only the cutoff changed. */
+static void
+reconfigure_if_filter (GstSdrDemod * d)
+{
+  gdouble cutoff = calc_effective_cutoff (d);
+  if (!d->fir_taps || d->n_taps <= 0)
+    return;
+  design_lowpass (d->fir_taps, d->n_taps, cutoff, (gdouble) d->sample_rate);
+  if (d->tail_i && d->tail_len > 0) {
+    memset (d->tail_i, 0, d->tail_len * sizeof (gfloat));
+    memset (d->tail_q, 0, d->tail_len * sizeof (gfloat));
+  }
+}
+
 static void
 configure (GstSdrDemod * d)
 {
@@ -195,11 +276,8 @@ configure (GstSdrDemod * d)
   d->n_taps = FIR_TAPS_IF;
   g_free (d->fir_taps);
   d->fir_taps = g_new0 (gfloat, d->n_taps);
-  if (d->mode == GST_SDR_MODE_FM)
-    cutoff = MIN ((gdouble) (d->max_deviation + (d->stereo ? 40000.0f : 12000.0f)),
-        0.45 * (gdouble) d->sample_rate);
-  else
-    cutoff = MIN ((gdouble) d->audio_cutoff, 0.45 * (gdouble) d->sample_rate);
+
+  cutoff = calc_effective_cutoff (d);
   design_lowpass (d->fir_taps, d->n_taps, cutoff, (gdouble) d->sample_rate);
 
   d->n_taps_audio = FIR_TAPS_AUDIO;
@@ -393,6 +471,19 @@ gst_sdr_demod_class_init (GstSdrDemodClass * klass)
       g_param_spec_float ("stereo-mix", "Stereo Mix", "L-R factor 0..1",
           0.0f, 1.0f, DEFAULT_STEREO_MIX,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (go, PROP_IF_BANDWIDTH,
+      g_param_spec_float ("if-bandwidth", "IF Bandwidth",
+          "Manual IF filter cutoff in Hz (0 = automatic, same as before "
+          "this property existed). Narrower = less adjacent noise, "
+          "weaker sensitivity to strong deviation peaks.",
+          0.0f, 200000.0f, DEFAULT_IF_BANDWIDTH,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (go, PROP_AUTO_BANDWIDTH,
+      g_param_spec_boolean ("auto-bandwidth", "Auto Bandwidth",
+          "Continuously hunt the narrowest IF bandwidth that still gives "
+          "good S/N on the current frequency (FM only; ignored for AM). "
+          "Overrides if-bandwidth while enabled.",
+          DEFAULT_AUTO_BANDWIDTH, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   bt->set_caps = gst_sdr_demod_set_caps;
   bt->transform = gst_sdr_demod_transform;
@@ -428,12 +519,24 @@ gst_sdr_demod_init (GstSdrDemod * d)
   d->nco_phase = d->nco_delta = 0.0f;
   d->pilot_phase = 0.0f;
   d->pilot_freq = PILOT_FREQ_HZ;
+
+  g_mutex_init (&d->cfg_lock);
+  d->if_bandwidth_hz = DEFAULT_IF_BANDWIDTH;
+  d->bw_current_hz = 0.0f;
+  d->auto_bandwidth = DEFAULT_AUTO_BANDWIDTH;
+  d->snr_lowband_pow = 0.0f;
+  d->snr_highband_pow = 0.0f;
+  d->snr_lpf_state = 0.0f;
+  d->snr_db_ema = AUTO_BW_TARGET_HIGH_DB;
+  d->auto_bw_hold = 0;
+  d->auto_bw_dir = 0;
 }
 
 static void
 gst_sdr_demod_finalize (GObject * o)
 {
   GstSdrDemod *d = GST_SDR_DEMOD (o);
+  g_mutex_clear (&d->cfg_lock);
   g_free (d->fir_taps);
   g_free (d->fir_audio);
   g_free (d->tail_i);
@@ -455,7 +558,9 @@ gst_sdr_demod_set_caps (GstBaseTransform * t, GstCaps * incaps, GstCaps * outcap
   if (!gst_structure_get_int (s, "rate", &rate) || rate <= 0)
     return FALSE;
   d->sample_rate = (guint) rate;
+  g_mutex_lock (&d->cfg_lock);
   configure (d);
+  g_mutex_unlock (&d->cfg_lock);
   return TRUE;
 }
 
@@ -529,6 +634,94 @@ gst_sdr_demod_transform_caps (GstBaseTransform * t, GstPadDirection dir,
   return ret;
 }
 
+/* S/N proxy for the auto-bandwidth hunt: split the FM composite signal
+ * (post-discriminator, pre audio-filter) into an in-band part via a
+ * one-pole LPF at roughly the audio/pilot edge, and a residual "out of
+ * band" part treated as a noise proxy. This is not a calibrated SNR
+ * measurement -- it's a cheap, monotonic-enough proxy: as adjacent-
+ * channel/thermal noise increases, out-of-band energy rises faster than
+ * in-band energy, so the ratio still tracks "is narrowing helping".
+ * Runs every buffer (cheap, O(n)); the actual bandwidth adjustment is
+ * rate-limited by AUTO_BW_HOLD_BUFFERS so it converges slowly instead
+ * of hunting every buffer. Caller already holds d->cfg_lock. */
+static void
+demod_snr_measure_and_hunt (GstSdrDemod * d, const gfloat * composite, gint n)
+{
+  gfloat fs, band_hz, rc, alpha, lp;
+  gdouble low_sum = 0.0, high_sum = 0.0;
+  gint i;
+
+  if (n <= 0 || d->mode != GST_SDR_MODE_FM || d->out_rate == 0)
+    return;
+
+  fs = (gfloat) d->out_rate;
+  band_hz = d->stereo ? 53000.0f : d->audio_cutoff;
+  if (band_hz > 0.45f * fs)
+    band_hz = 0.45f * fs;
+  rc = 1.0f / (2.0f * (gfloat) M_PI * band_hz);
+  alpha = (1.0f / fs) / (rc + 1.0f / fs);
+  lp = d->snr_lpf_state;
+
+  for (i = 0; i < n; i++) {
+    gfloat x = composite[i];
+    gfloat hf;
+    lp += alpha * (x - lp);
+    hf = x - lp;
+    low_sum += (gdouble) (lp * lp);
+    high_sum += (gdouble) (hf * hf);
+  }
+  d->snr_lpf_state = lp;
+
+  {
+    gfloat low_pow = (gfloat) (low_sum / n);
+    gfloat high_pow = (gfloat) (high_sum / n);
+    gfloat snr_db;
+    d->snr_lowband_pow = 0.95f * d->snr_lowband_pow + 0.05f * low_pow;
+    d->snr_highband_pow = 0.95f * d->snr_highband_pow + 0.05f * high_pow;
+    snr_db = 10.0f * log10f ((d->snr_lowband_pow + 1e-12f) / (d->snr_highband_pow + 1e-9f));
+    d->snr_db_ema = 0.8f * d->snr_db_ema + 0.2f * snr_db;
+  }
+
+  if (!d->auto_bandwidth)
+    return;
+  if (++d->auto_bw_hold < AUTO_BW_HOLD_BUFFERS)
+    return;
+  d->auto_bw_hold = 0;
+
+  {
+    gdouble bw_min, bw_legacy;
+    gfloat range, step, cur, next;
+    calc_bw_bounds (d, &bw_min, &bw_legacy);
+    range = (gfloat) (bw_legacy - bw_min);
+    if (range <= 0.0f)
+      return;
+    step = range * AUTO_BW_STEP_FRAC;
+    cur = d->bw_current_hz > 0.0f ? d->bw_current_hz : (gfloat) bw_legacy;
+    next = cur;
+
+    if (d->snr_db_ema < AUTO_BW_TARGET_LOW_DB && cur > (gfloat) bw_min + 1.0f) {
+      next = cur - step;
+      if (next < (gfloat) bw_min)
+        next = (gfloat) bw_min;
+      d->auto_bw_dir = -1;
+    } else if (d->snr_db_ema > AUTO_BW_TARGET_HIGH_DB && cur < (gfloat) bw_legacy - 1.0f) {
+      next = cur + step;
+      if (next > (gfloat) bw_legacy)
+        next = (gfloat) bw_legacy;
+      d->auto_bw_dir = 1;
+    } else {
+      d->auto_bw_dir = 0;
+    }
+
+    if (fabsf (next - cur) > 1.0f) {
+      d->bw_current_hz = next;
+      reconfigure_if_filter (d);
+      GST_DEBUG_OBJECT (d, "auto-bandwidth: snr=%.1fdB bw %.0f -> %.0f Hz",
+          d->snr_db_ema, cur, next);
+    }
+  }
+}
+
 static GstFlowReturn
 gst_sdr_demod_transform (GstBaseTransform * t, GstBuffer * inbuf, GstBuffer * outbuf)
 {
@@ -545,6 +738,8 @@ gst_sdr_demod_transform (GstBaseTransform * t, GstBuffer * inbuf, GstBuffer * ou
   in = (gfloat *) inmap.data;
   out = (gfloat *) outmap.data;
   n_iq = (gint) (inmap.size / (2 * sizeof (gfloat)));
+
+  g_mutex_lock (&d->cfg_lock);
 
   {
     gsize need = (gsize) n_iq * 4 + 256;
@@ -598,6 +793,7 @@ gst_sdr_demod_transform (GstBaseTransform * t, GstBuffer * inbuf, GstBuffer * ou
     if (d->mode == GST_SDR_MODE_FM) {
       gfloat *composite = d->scratch;
       fm_disc (d, di, dq, n_if, composite);
+      demod_snr_measure_and_hunt (d, composite, n_if);
 
       if (d->stereo) {
         gfloat *L = d->scratch2;
@@ -647,6 +843,8 @@ gst_sdr_demod_transform (GstBaseTransform * t, GstBuffer * inbuf, GstBuffer * ou
     }
   }
 
+  g_mutex_unlock (&d->cfg_lock);
+
   gst_buffer_unmap (inbuf, &inmap);
   gst_buffer_unmap (outbuf, &outmap);
   gst_buffer_set_size (outbuf, n_aud * ch * sizeof (gfloat));
@@ -682,6 +880,24 @@ gst_sdr_demod_set_property (GObject * o, guint id, const GValue * v, GParamSpec 
     case PROP_STEREO_MIX:
       d->stereo_mix = g_value_get_float (v);
       break;
+    case PROP_IF_BANDWIDTH:
+      g_mutex_lock (&d->cfg_lock);
+      d->if_bandwidth_hz = g_value_get_float (v);
+      if (!d->auto_bandwidth)
+        reconfigure_if_filter (d);
+      g_mutex_unlock (&d->cfg_lock);
+      break;
+    case PROP_AUTO_BANDWIDTH:
+      g_mutex_lock (&d->cfg_lock);
+      d->auto_bandwidth = g_value_get_boolean (v);
+      d->auto_bw_hold = 0;
+      d->auto_bw_dir = 0;
+      d->snr_db_ema = AUTO_BW_TARGET_HIGH_DB;
+      if (!d->auto_bandwidth)
+        d->bw_current_hz = 0.0f;      /* fall back to legacy/manual cutoff */
+      reconfigure_if_filter (d);
+      g_mutex_unlock (&d->cfg_lock);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (o, id, p);
   }
@@ -715,6 +931,15 @@ gst_sdr_demod_get_property (GObject * o, guint id, GValue * v, GParamSpec * p)
       break;
     case PROP_STEREO_MIX:
       g_value_set_float (v, d->stereo_mix);
+      break;
+    case PROP_IF_BANDWIDTH:
+      /* Reads back the *effective* cutoff (bw_current_hz) once configured,
+       * so a GUI can show what auto-bandwidth actually landed on. Before
+       * the first configure() it reports the raw requested value. */
+      g_value_set_float (v, d->bw_current_hz > 0.0f ? d->bw_current_hz : d->if_bandwidth_hz);
+      break;
+    case PROP_AUTO_BANDWIDTH:
+      g_value_set_boolean (v, d->auto_bandwidth);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (o, id, p);

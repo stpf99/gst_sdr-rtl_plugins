@@ -15,6 +15,8 @@ enum {
   PROP_FREQUENCY,
   PROP_SAMPLE_RATE,
   PROP_GAIN,
+  PROP_AUTO_GAIN,
+  PROP_AUTO_GAIN_TARGET,
   PROP_LAST
 };
 
@@ -24,6 +26,19 @@ enum {
 #define DEFAULT_FREQ 100000000
 #define DEFAULT_SRATE 1000000
 #define DEFAULT_GAIN 0.0f
+#define DEFAULT_AUTO_GAIN FALSE
+/* Target mean IQ power in dBFS (0 dBFS = full-scale sine). RTL-SDR IQ
+ * sits well under full scale in normal reception; -18 dBFS leaves
+ * headroom against sudden strong-signal peaks while still using most
+ * of the ADC's dynamic range. */
+#define DEFAULT_AUTO_GAIN_TARGET -18.0f
+#define AUTO_GAIN_MIN 0.9f
+#define AUTO_GAIN_MAX 49.6f
+#define AUTO_GAIN_STEP_DB 1.0f
+/* Only re-evaluate every N buffers so the loop doesn't chase every
+ * momentary blip (each buffer is tens of ms at typical sample rates --
+ * this gives a AGC response time on the order of a few hundred ms). */
+#define AUTO_GAIN_HOLD_BUFFERS 6
 
 #define RTL_TCP_MAGIC "RTL0"
 
@@ -46,6 +61,8 @@ static void gst_sdr_src_finalize (GObject * object);
 
 static gboolean gst_sdr_src_start (GstBaseSrc * src);
 static gboolean gst_sdr_src_stop (GstBaseSrc * src);
+static gboolean gst_sdr_src_unlock (GstBaseSrc * src);
+static gboolean gst_sdr_src_unlock_stop (GstBaseSrc * src);
 static GstCaps *gst_sdr_src_get_caps (GstBaseSrc * src, GstCaps * filter);
 static gboolean gst_sdr_src_negotiate (GstBaseSrc * src);
 static GstFlowReturn gst_sdr_src_create (GstPushSrc * src, GstBuffer ** buf);
@@ -70,6 +87,88 @@ gst_sdr_src_send_cmd (GstSdrSrc * sdr, guint8 op, guint32 val)
     return FALSE;
   }
   return TRUE;
+}
+
+/* Push a (possibly new) manual gain value out to whichever backend is
+ * active. Shared by PROP_GAIN's set_property and the auto-gain loop in
+ * create(), so both paths stay consistent with each other. */
+static void
+gst_sdr_src_apply_gain (GstSdrSrc * sdr)
+{
+  if (sdr->connected && sdr->sock_fd >= 0) {
+    if (sdr->gain > 0.0f) {
+      gst_sdr_src_send_cmd (sdr, 0x03, 1);
+      gst_sdr_src_send_cmd (sdr, 0x04, (guint) (sdr->gain * 10.0f + 0.5f));
+    } else {
+      gst_sdr_src_send_cmd (sdr, 0x03, 0);
+      gst_sdr_src_send_cmd (sdr, 0x08, 1);
+    }
+  }
+#if HAVE_RTLSDR
+  else if (sdr->rtl_dev) {
+    if (sdr->gain > 0.0f) {
+      rtlsdr_set_tuner_gain_mode ((rtlsdr_dev_t *) sdr->rtl_dev, 1);
+      rtlsdr_set_tuner_gain ((rtlsdr_dev_t *) sdr->rtl_dev, (int) (sdr->gain * 10.0f + 0.5f));
+    } else {
+      rtlsdr_set_tuner_gain_mode ((rtlsdr_dev_t *) sdr->rtl_dev, 0);
+    }
+  }
+#endif
+}
+
+/* Software AGC: measures mean IQ power over the just-produced buffer,
+ * tracks it with a slow EMA (so single strong pulses/fades don't jerk
+ * the gain around), and every AUTO_GAIN_HOLD_BUFFERS buffers nudges
+ * `gain` by one step towards auto_gain_target_db. Runs entirely inside
+ * the source -- no external control loop needed, so it keeps working
+ * the same way whether driven from gst-launch, the GTK4 GUI, or
+ * anything else that just sets auto-gain=true. */
+static void
+gst_sdr_src_auto_gain_update (GstSdrSrc * sdr, const gfloat * iq, gsize n_pairs)
+{
+  gdouble sum = 0.0;
+  gfloat power_db;
+  gsize i;
+
+  if (!sdr->auto_gain || n_pairs == 0)
+    return;
+
+  for (i = 0; i < n_pairs; i++) {
+    gfloat ii = iq[i * 2 + 0], qq = iq[i * 2 + 1];
+    sum += (gdouble) (ii * ii + qq * qq);
+  }
+  power_db = 10.0f * log10f ((gfloat) (sum / (gdouble) n_pairs) + 1e-12f);
+
+  if (!sdr->power_ema_init) {
+    sdr->power_ema_db = power_db;
+    sdr->power_ema_init = TRUE;
+  } else {
+    sdr->power_ema_db = 0.9f * sdr->power_ema_db + 0.1f * power_db;
+  }
+
+  if (++sdr->auto_gain_hold < AUTO_GAIN_HOLD_BUFFERS)
+    return;
+  sdr->auto_gain_hold = 0;
+
+  if (sdr->power_ema_db < sdr->auto_gain_target_db - 1.0f) {
+    gfloat g = sdr->gain <= 0.0f ? AUTO_GAIN_MIN : sdr->gain + AUTO_GAIN_STEP_DB;
+    if (g > AUTO_GAIN_MAX)
+      g = AUTO_GAIN_MAX;
+    if (g != sdr->gain) {
+      sdr->gain = g;
+      gst_sdr_src_apply_gain (sdr);
+      GST_DEBUG_OBJECT (sdr, "auto-gain: power=%.1fdB -> gain up to %.1fdB", sdr->power_ema_db, g);
+    }
+  } else if (sdr->power_ema_db > sdr->auto_gain_target_db + 1.0f) {
+    gfloat g = sdr->gain - AUTO_GAIN_STEP_DB;
+    if (g < AUTO_GAIN_MIN)
+      g = AUTO_GAIN_MIN;
+    if (g != sdr->gain) {
+      sdr->gain = g;
+      gst_sdr_src_apply_gain (sdr);
+      GST_DEBUG_OBJECT (sdr, "auto-gain: power=%.1fdB -> gain down to %.1fdB", sdr->power_ema_db, g);
+    }
+  }
 }
 
 static gboolean
@@ -340,11 +439,27 @@ gst_sdr_src_class_init (GstSdrSrcClass * klass)
 
   g_object_class_install_property (gobject_class, PROP_GAIN,
       g_param_spec_float ("gain", "Gain",
-          "Tuner gain in dB (0 = auto)", 0.0f, 50.0f, DEFAULT_GAIN,
+          "Tuner gain in dB (0 = hardware AGC). Overridden live while "
+          "auto-gain=true, but keeps working exactly as before otherwise.",
+          0.0f, 50.0f, DEFAULT_GAIN,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_AUTO_GAIN,
+      g_param_spec_boolean ("auto-gain", "Auto Gain",
+          "Software AGC: continuously adjust gain towards auto-gain-target-db "
+          "(default off, existing manual 'gain' behaviour is unchanged)",
+          DEFAULT_AUTO_GAIN, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_AUTO_GAIN_TARGET,
+      g_param_spec_float ("auto-gain-target-db", "Auto Gain Target",
+          "Target mean IQ power in dBFS for the auto-gain loop",
+          -60.0f, 0.0f, DEFAULT_AUTO_GAIN_TARGET,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   gstbasesrc_class->start = gst_sdr_src_start;
   gstbasesrc_class->stop = gst_sdr_src_stop;
+  gstbasesrc_class->unlock = gst_sdr_src_unlock;
+  gstbasesrc_class->unlock_stop = gst_sdr_src_unlock_stop;
   gstbasesrc_class->get_caps = gst_sdr_src_get_caps;
   gstbasesrc_class->negotiate = gst_sdr_src_negotiate;
   gstpushsrc_class->create = gst_sdr_src_create;
@@ -365,6 +480,12 @@ gst_sdr_src_init (GstSdrSrc * sdr)
   sdr->recv_buf = g_malloc (sdr->recv_buf_size);
   sdr->has_pending_byte = FALSE;
   sdr->pending_byte = 0;
+  sdr->flushing = FALSE;
+  sdr->auto_gain = DEFAULT_AUTO_GAIN;
+  sdr->auto_gain_target_db = DEFAULT_AUTO_GAIN_TARGET;
+  sdr->power_ema_db = 0.0f;
+  sdr->power_ema_init = FALSE;
+  sdr->auto_gain_hold = 0;
 #if HAVE_RTLSDR
   sdr->rtl_dev = NULL;
 #endif
@@ -423,6 +544,44 @@ gst_sdr_src_stop (GstBaseSrc * src)
   return TRUE;
 }
 
+/* ---- Interrupting blocking I/O on state change --------------------------
+ *
+ * gst_sdr_src_create() below blocks in recv()/rtlsdr_read_sync() with no
+ * timeout. For a live=TRUE source, GstBaseSrc relies on unlock() to break
+ * that blocking call when the pipeline is asked to PAUSE (e.g. Ctrl+C in
+ * gst-launch, or a client app tearing down to retune). Without it, the
+ * PLAYING->PAUSED transition hangs until data happens to arrive, and the
+ * process often ends up force-killed instead of closing the TCP connection
+ * cleanly. On a remote rtl_tcp server (e.g. one running on a router) that
+ * can leave a half-torn-down "phantom" client holding the tuner at the old
+ * frequency for a while, so the *next* gst-launch invocation's SET_FREQ
+ * either arrives late or is served stale samples from before the retune -
+ * symptom: you ask for frequency X but keep hearing whatever was tuned
+ * previously. shutdown() on the fd wakes the blocked recv() immediately
+ * with a clean return, letting stop()/tcp_disconnect() close() the socket
+ * right away instead of leaving it to linger.
+ */
+
+static gboolean
+gst_sdr_src_unlock (GstBaseSrc * src)
+{
+  GstSdrSrc *sdr = GST_SDR_SRC (src);
+
+  sdr->flushing = TRUE;
+  if (sdr->sock_fd >= 0)
+    shutdown (sdr->sock_fd, SHUT_RDWR);
+  return TRUE;
+}
+
+static gboolean
+gst_sdr_src_unlock_stop (GstBaseSrc * src)
+{
+  GstSdrSrc *sdr = GST_SDR_SRC (src);
+
+  sdr->flushing = FALSE;
+  return TRUE;
+}
+
 static GstFlowReturn
 gst_sdr_src_create (GstPushSrc * src, GstBuffer ** buf)
 {
@@ -434,6 +593,9 @@ gst_sdr_src_create (GstPushSrc * src, GstBuffer ** buf)
   if (!sdr->connected)
     return GST_FLOW_ERROR;
 
+  if (sdr->flushing)
+    return GST_FLOW_FLUSHING;
+
 #if HAVE_RTLSDR
   if (sdr->rtl_dev) {
     /* USB path: read a fixed-size chunk of uint8 IQ */
@@ -443,7 +605,7 @@ gst_sdr_src_create (GstPushSrc * src, GstBuffer ** buf)
     n_read = rtlsdr_read_sync ((rtlsdr_dev_t *) sdr->rtl_dev,
         sdr->recv_buf, (int) want, NULL);
     if (n_read <= 0)
-      return GST_FLOW_EOS;
+      return sdr->flushing ? GST_FLOW_FLUSHING : GST_FLOW_EOS;
 
     n_iq_pairs = (gsize) n_read / 2;
     *buf = gst_buffer_new_allocate (NULL, n_iq_pairs * 2 * sizeof (gfloat), NULL);
@@ -454,6 +616,7 @@ gst_sdr_src_create (GstPushSrc * src, GstBuffer ** buf)
       out[i * 2 + 0] = ((gfloat) sdr->recv_buf[i * 2 + 0] - 127.5f) / 127.5f;
       out[i * 2 + 1] = ((gfloat) sdr->recv_buf[i * 2 + 1] - 127.5f) / 127.5f;
     }
+    gst_sdr_src_auto_gain_update (sdr, out, n_iq_pairs);
     gst_buffer_unmap (*buf, &map);
     return GST_FLOW_OK;
   }
@@ -467,7 +630,7 @@ gst_sdr_src_create (GstPushSrc * src, GstBuffer ** buf)
 
     n_read = recv (sdr->sock_fd, sdr->recv_buf, sdr->recv_buf_size, 0);
     if (n_read <= 0)
-      return GST_FLOW_EOS;
+      return sdr->flushing ? GST_FLOW_FLUSHING : GST_FLOW_EOS;
 
     in = sdr->recv_buf;
     total_bytes = (gsize) n_read + (sdr->has_pending_byte ? 1 : 0);
@@ -497,6 +660,7 @@ gst_sdr_src_create (GstPushSrc * src, GstBuffer ** buf)
       sdr->has_pending_byte = TRUE;
     }
 
+    gst_sdr_src_auto_gain_update (sdr, out, n_iq_pairs);
     gst_buffer_unmap (*buf, &map);
     return GST_FLOW_OK;
   }
@@ -540,15 +704,15 @@ gst_sdr_src_set_property (GObject * object, guint prop_id,
       break;
     case PROP_GAIN:
       sdr->gain = g_value_get_float (value);
-      if (sdr->connected && sdr->sock_fd >= 0) {
-        if (sdr->gain > 0.0f) {
-          gst_sdr_src_send_cmd (sdr, 0x03, 1);
-          gst_sdr_src_send_cmd (sdr, 0x04, (guint) (sdr->gain * 10));
-        } else {
-          gst_sdr_src_send_cmd (sdr, 0x03, 0);
-          gst_sdr_src_send_cmd (sdr, 0x08, 1);
-        }
-      }
+      gst_sdr_src_apply_gain (sdr);
+      break;
+    case PROP_AUTO_GAIN:
+      sdr->auto_gain = g_value_get_boolean (value);
+      sdr->power_ema_init = FALSE;
+      sdr->auto_gain_hold = 0;
+      break;
+    case PROP_AUTO_GAIN_TARGET:
+      sdr->auto_gain_target_db = g_value_get_float (value);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -580,6 +744,12 @@ gst_sdr_src_get_property (GObject * object, guint prop_id,
       break;
     case PROP_GAIN:
       g_value_set_float (value, sdr->gain);
+      break;
+    case PROP_AUTO_GAIN:
+      g_value_set_boolean (value, sdr->auto_gain);
+      break;
+    case PROP_AUTO_GAIN_TARGET:
+      g_value_set_float (value, sdr->auto_gain_target_db);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);

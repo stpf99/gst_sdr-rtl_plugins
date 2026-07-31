@@ -23,13 +23,20 @@ GST_DEBUG_CATEGORY_STATIC (gst_sdr_denoise_debug);
 #define GST_CAT_DEFAULT gst_sdr_denoise_debug
 
 enum {
-  PROP_0, PROP_ENABLED, PROP_THRESHOLD, PROP_ALPHA_UP, PROP_ALPHA_DOWN, PROP_LAST
+  PROP_0, PROP_ENABLED, PROP_THRESHOLD, PROP_ALPHA_UP, PROP_ALPHA_DOWN,
+  PROP_INTERPOLATE, PROP_AUTO_INTERPOLATE, PROP_INTERP_STRENGTH, PROP_LAST
 };
 
 #define DEFAULT_ENABLED TRUE
 #define DEFAULT_THRESHOLD 8.0f
 #define DEFAULT_ALPHA_UP 0.01f
 #define DEFAULT_ALPHA_DOWN 0.0001f
+/* --interpolate / --auto-interpolate: a light adaptive smoothing pass
+ * (one-pole lowpass) applied after denoising. Off by default -- with
+ * both left at their defaults this element behaves exactly as before. */
+#define DEFAULT_INTERPOLATE FALSE
+#define DEFAULT_AUTO_INTERPOLATE FALSE
+#define DEFAULT_INTERP_STRENGTH 0.5f
 
 static GstStaticPadTemplate sinktemplate = GST_STATIC_PAD_TEMPLATE ("sink",
     GST_PAD_SINK, GST_PAD_ALWAYS,
@@ -261,6 +268,66 @@ denoise_process_channel (GstSdrDenoise * d, gint ch, const gfloat * in, gint n, 
   return out_n;
 }
 
+/* Adaptive smoothing pass, applied per channel after denoising (or
+ * even with denoising disabled -- it's independent). In manual mode
+ * (`interpolate`) the smoothing amount is fixed at `interp-strength`.
+ * In `auto-interpolate` mode it's derived every buffer from a cheap
+ * time-domain noise proxy: EMA of squared first-difference (~HF/noise
+ * content) versus EMA of squared sample value (~signal level). This is
+ * intentionally simple (a one-pole smoother, not a polyphase resampler)
+ * so it's cheap enough to run unconditionally and has no failure modes
+ * -- it trades a little top-end for fewer audible artifacts once the
+ * IF bandwidth has been narrowed down for a weak signal. */
+static void
+denoise_apply_interp (GstSdrDenoise * d, gint ch, gfloat * buf, gint n)
+{
+  gfloat state = d->interp_state[ch];
+  gfloat hf_ema = d->hf_energy_ema[ch];
+  gfloat lf_ema = d->lf_energy_ema[ch];
+  gfloat prev = d->prev_sample[ch];
+  gint i;
+
+  if (n <= 0)
+    return;
+
+  if (!d->interpolate && !d->auto_interpolate) {
+    d->prev_sample[ch] = buf[n - 1];
+    return;
+  }
+
+  for (i = 0; i < n; i++) {
+    gfloat x = buf[i];
+    gfloat d1 = x - prev;
+    lf_ema = 0.99f * lf_ema + 0.01f * (x * x);
+    hf_ema = 0.99f * hf_ema + 0.01f * (d1 * d1);
+    prev = x;
+  }
+
+  {
+    gfloat strength, coeff;
+    if (d->auto_interpolate) {
+      gfloat noise_db = 10.0f * log10f ((hf_ema + 1e-12f) / (lf_ema + 1e-9f));
+      /* Calibration: roughly -40dB (clean, HF << signal) -> strength 0,
+       * -10dB (choppy/noisy) -> strength 1. Tune against real signals. */
+      strength = (noise_db + 40.0f) / 30.0f;
+      strength = CLAMP (strength, 0.0f, 1.0f);
+    } else {
+      strength = d->interp_strength;
+    }
+    coeff = 1.0f - 0.9f * strength; /* 1.0 = passthrough, 0.1 = heavy smoothing */
+
+    for (i = 0; i < n; i++) {
+      state += coeff * (buf[i] - state);
+      buf[i] = state;
+    }
+  }
+
+  d->interp_state[ch] = state;
+  d->hf_energy_ema[ch] = hf_ema;
+  d->lf_energy_ema[ch] = lf_ema;
+  d->prev_sample[ch] = prev;
+}
+
 static void
 gst_sdr_denoise_class_init (GstSdrDenoiseClass * klass)
 {
@@ -298,6 +365,23 @@ gst_sdr_denoise_class_init (GstSdrDenoiseClass * klass)
       g_param_spec_float ("alpha-down", "Alpha Down",
           "Noise floor fall rate (per hop) when the signal dips below the floor",
           0.00001f, 1.0f, DEFAULT_ALPHA_DOWN, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (go, PROP_INTERPOLATE,
+      g_param_spec_boolean ("interpolate", "Interpolate",
+          "Apply a light adaptive smoothing pass after denoising, "
+          "strength fixed at interp-strength (default off, unchanged "
+          "behaviour otherwise)",
+          DEFAULT_INTERPOLATE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (go, PROP_AUTO_INTERPOLATE,
+      g_param_spec_boolean ("auto-interpolate", "Auto Interpolate",
+          "Derive the smoothing strength automatically from a HF/LF noise "
+          "proxy each buffer, instead of using a fixed interp-strength",
+          DEFAULT_AUTO_INTERPOLATE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (go, PROP_INTERP_STRENGTH,
+      g_param_spec_float ("interp-strength", "Interpolation Strength",
+          "Manual smoothing amount 0 (bypass) .. 1 (heavy) used when "
+          "interpolate=true and auto-interpolate=false",
+          0.0f, 1.0f, DEFAULT_INTERP_STRENGTH,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   bt->set_caps = gst_sdr_denoise_set_caps;
   bt->transform = gst_sdr_denoise_transform;
@@ -328,6 +412,14 @@ gst_sdr_denoise_init (GstSdrDenoise * d)
   d->out_queue[0] = d->out_queue[1] = NULL;
   d->out_queue_n[0] = d->out_queue_n[1] = 0;
   d->out_queue_cap[0] = d->out_queue_cap[1] = 0;
+
+  d->interpolate = DEFAULT_INTERPOLATE;
+  d->auto_interpolate = DEFAULT_AUTO_INTERPOLATE;
+  d->interp_strength = DEFAULT_INTERP_STRENGTH;
+  d->interp_state[0] = d->interp_state[1] = 0.0f;
+  d->hf_energy_ema[0] = d->hf_energy_ema[1] = 0.0f;
+  d->lf_energy_ema[0] = d->lf_energy_ema[1] = 1e-6f;
+  d->prev_sample[0] = d->prev_sample[1] = 0.0f;
 }
 
 static void
@@ -405,6 +497,7 @@ gst_sdr_denoise_transform (GstBaseTransform * t, GstBuffer * inbuf, GstBuffer * 
 
   if (d->channels == 1) {
     out_n = denoise_process_channel (d, 0, in, n_frames, out);
+    denoise_apply_interp (d, 0, out, out_n);
   } else {
     gfloat *outL = d->deint[0];
     gfloat *outR = d->deint[1];
@@ -419,6 +512,8 @@ gst_sdr_denoise_transform (GstBaseTransform * t, GstBuffer * inbuf, GstBuffer * 
     }
     nL = denoise_process_channel (d, 0, tmpL, n_frames, outL);
     nR = denoise_process_channel (d, 1, tmpR, n_frames, outR);
+    denoise_apply_interp (d, 0, outL, nL);
+    denoise_apply_interp (d, 1, outR, nR);
     m = MIN (nL, nR);
     for (i = 0; i < m; i++) {
       out[i * 2 + 0] = outL[i];
@@ -442,6 +537,9 @@ gst_sdr_denoise_set_property (GObject * o, guint id, const GValue * v, GParamSpe
     case PROP_THRESHOLD: d->threshold_db = g_value_get_float (v); break;
     case PROP_ALPHA_UP: d->alpha_up = g_value_get_float (v); break;
     case PROP_ALPHA_DOWN: d->alpha_down = g_value_get_float (v); break;
+    case PROP_INTERPOLATE: d->interpolate = g_value_get_boolean (v); break;
+    case PROP_AUTO_INTERPOLATE: d->auto_interpolate = g_value_get_boolean (v); break;
+    case PROP_INTERP_STRENGTH: d->interp_strength = g_value_get_float (v); break;
     default: G_OBJECT_WARN_INVALID_PROPERTY_ID (o, id, p);
   }
 }
@@ -455,6 +553,9 @@ gst_sdr_denoise_get_property (GObject * o, guint id, GValue * v, GParamSpec * p)
     case PROP_THRESHOLD: g_value_set_float (v, d->threshold_db); break;
     case PROP_ALPHA_UP: g_value_set_float (v, d->alpha_up); break;
     case PROP_ALPHA_DOWN: g_value_set_float (v, d->alpha_down); break;
+    case PROP_INTERPOLATE: g_value_set_boolean (v, d->interpolate); break;
+    case PROP_AUTO_INTERPOLATE: g_value_set_boolean (v, d->auto_interpolate); break;
+    case PROP_INTERP_STRENGTH: g_value_set_float (v, d->interp_strength); break;
     default: G_OBJECT_WARN_INVALID_PROPERTY_ID (o, id, p);
   }
 }
