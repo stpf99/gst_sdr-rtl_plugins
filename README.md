@@ -11,4 +11,16 @@ ninja
 sudo ninja install
 
 
+❯ gst-inspect-1.0 | grep sdr
+
+sdrplugins:  sdrdemod: SDR AM/FM Demodulator
+
+sdrplugins:  sdrdenoise: SDR Anomaly-based Noise Reduction
+
+sdrplugins:  sdrsrc: SDR IQ Source
+
+
+
+
+
 gnome dir containing  gnome shell 50 extension applet for fm/am // ~/.local/share/gnome-shell/extensions/$:unzip_here/ and navigate in www browser to https://extensions.gnome.org/local/ to manage (setup rtl-sdr -tcp -local etc add stations)
